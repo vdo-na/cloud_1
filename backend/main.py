@@ -1,16 +1,24 @@
 """
-Минимальный backend интернет-магазина для лабы №1 (п.2).
-Подключается к PostgreSQL через Pgpool II.
-DATABASE_URL по умолчанию — localhost:9999; в Docker — хост pgpool.
+Минимальный backend интернет-магазина для лабы №1 (п.3).
+Товары (каталог) хранятся в PostgreSQL через Pgpool II.
+Корзина пользователей перенесена в NoSQL базу данных MongoDB.
 """
+import sys
+import io
+
+# Принудительно устанавливаем кодировку вывода в UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 import os
 import time
 from decimal import Decimal
 from typing import List
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from pymongo import MongoClient, ReturnDocument
 from sqlalchemy import (
     CheckConstraint,
     Column,
@@ -21,9 +29,11 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
-from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+# ---------- Подключение к PostgreSQL ----------
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg2://app:app@localhost:9999/appdb",
@@ -34,6 +44,17 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+# ---------- Подключение к MongoDB ----------
+MONGO_URL = os.getenv(
+    "MONGO_URL",
+    "mongodb://localhost:27017/shop_db",
+)
+mongo_client = MongoClient(MONGO_URL)
+mongo_db = mongo_client.get_default_database()
+cart_collection = mongo_db["cart_items"]
+
+
+# ---------- SQLAlchemy модели (PostgreSQL) ----------
 class Product(Base):
     __tablename__ = "products"
 
@@ -48,9 +69,8 @@ class Product(Base):
         CheckConstraint("stock >= 0", name="stock_non_negative"),
     )
 
-    cart_items = relationship("CartItem", back_populates="product", cascade="all, delete-orphan")
 
-
+# Старая таблица корзины (оставлена в схеме для возможности миграции данных)
 class CartItem(Base):
     __tablename__ = "cart_items"
 
@@ -63,8 +83,6 @@ class CartItem(Base):
         UniqueConstraint("user_id", "product_id", name="uq_user_product"),
         CheckConstraint("quantity > 0", name="quantity_positive"),
     )
-
-    product = relationship("Product", back_populates="cart_items")
 
 
 SEED_PRODUCTS = [
@@ -95,14 +113,20 @@ def seed_if_empty(db: Session) -> None:
 
 app = FastAPI(
     title="Shop API",
-    description="Минимальный CRUD интернет-магазина (товары + корзина)",
-    version="1.0.0",
+    description="Минимальный CRUD интернет-магазина (PostgreSQL товары + MongoDB корзина)",
+    version="2.0.0",
 )
 
 
 @app.on_event("startup")
 def on_startup():
-    # Ждём pgpool/postgres (в docker compose они могут стартовать чуть позже)
+    # 1. Настройка индексов MongoDB
+    try:
+        cart_collection.create_index([("user_id", 1), ("product_id", 1)], unique=True)
+    except Exception as exc:
+        print(f"Предупреждение при создании индекса MongoDB: {exc}")
+
+    # 2. Ожидание и инициализация PostgreSQL / Pgpool
     last_error = None
     for attempt in range(30):
         try:
@@ -116,7 +140,7 @@ def on_startup():
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             time.sleep(2)
-    raise RuntimeError(f"Не удалось подключиться к БД: {last_error}")
+    raise RuntimeError(f"Не удалось подключиться к БД PostgreSQL: {last_error}")
 
 
 # ---------- Pydantic-схемы ----------
@@ -155,15 +179,13 @@ class CartItemUpdate(BaseModel):
 
 
 class CartItemOut(BaseModel):
-    id: int
+    id: str  # В Mongo идентификатор позиции представлен строковым ObjectId
     user_id: str
     product_id: int
     quantity: int
     product_name: str
     product_price: Decimal
     line_total: Decimal
-
-    model_config = {"from_attributes": True}
 
 
 class CartOut(BaseModel):
@@ -172,19 +194,7 @@ class CartOut(BaseModel):
     total: Decimal
 
 
-def cart_item_to_out(item: CartItem) -> CartItemOut:
-    return CartItemOut(
-        id=item.id,
-        user_id=item.user_id,
-        product_id=item.product_id,
-        quantity=item.quantity,
-        product_name=item.product.name,
-        product_price=item.product.price,
-        line_total=item.product.price * item.quantity,
-    )
-
-
-# ---------- Товары ----------
+# ---------- Товары (PostgreSQL Multimaster) ----------
 
 @app.get("/products", response_model=List[ProductOut])
 def list_products(db: Session = Depends(get_db)):
@@ -231,94 +241,141 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
-# ---------- Корзина ----------
+# ---------- Корзина (MongoDB) ----------
 
 @app.get("/cart/{user_id}", response_model=CartOut)
 def get_cart(user_id: str, db: Session = Depends(get_db)):
-    items = (
-        db.query(CartItem)
-        .filter(CartItem.user_id == user_id)
-        .order_by(CartItem.id)
-        .all()
-    )
-    out_items = [cart_item_to_out(i) for i in items]
+    # Читаем элементы корзины пользователя из MongoDB
+    docs = list(cart_collection.find({"user_id": user_id}))
+    if not docs:
+        return CartOut(user_id=user_id, items=[], total=Decimal("0"))
+
+    # Собираем product_id для пакетного запроса данных из PostgreSQL
+    product_ids = [doc["product_id"] for doc in docs]
+    products = db.query(Product).filter(Product.id.in_(product_ids)).all()
+    prod_map = {p.id: p for p in products}
+
+    out_items: List[CartItemOut] = []
+    for doc in docs:
+        prod = prod_map.get(doc["product_id"])
+        name = prod.name if prod else "Неизвестный товар"
+        price = prod.price if prod else Decimal("0.00")
+        qty = doc["quantity"]
+        out_items.append(
+            CartItemOut(
+                id=str(doc["_id"]),
+                user_id=doc["user_id"],
+                product_id=doc["product_id"],
+                quantity=qty,
+                product_name=name,
+                product_price=price,
+                line_total=price * qty,
+            )
+        )
+
     total = sum((i.line_total for i in out_items), Decimal("0"))
     return CartOut(user_id=user_id, items=out_items, total=total)
 
 
 @app.post("/cart/{user_id}/items", response_model=CartItemOut, status_code=201)
 def add_to_cart(user_id: str, payload: CartItemCreate, db: Session = Depends(get_db)):
+    # 1. Проверяем наличие товара и остаток на складе в PostgreSQL
     product = db.get(Product, payload.product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Товар не найден")
-    if product.stock < payload.quantity:
+
+    existing_doc = cart_collection.find_one({"user_id": user_id, "product_id": payload.product_id})
+    current_qty = existing_doc["quantity"] if existing_doc else 0
+    total_qty = current_qty + payload.quantity
+
+    if product.stock < total_qty:
         raise HTTPException(status_code=400, detail="Недостаточно товара на складе")
 
-    item = (
-        db.query(CartItem)
-        .filter(CartItem.user_id == user_id, CartItem.product_id == payload.product_id)
-        .first()
+    # 2. Сохраняем/обновляем в MongoDB
+    doc = cart_collection.find_one_and_update(
+        {"user_id": user_id, "product_id": payload.product_id},
+        {"$inc": {"quantity": payload.quantity}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
-    if item:
-        new_qty = item.quantity + payload.quantity
-        if product.stock < new_qty:
-            raise HTTPException(status_code=400, detail="Недостаточно товара на складе")
-        item.quantity = new_qty
-    else:
-        item = CartItem(
-            user_id=user_id,
-            product_id=payload.product_id,
-            quantity=payload.quantity,
-        )
-        db.add(item)
 
-    db.commit()
-    db.refresh(item)
-    return cart_item_to_out(item)
+    return CartItemOut(
+        id=str(doc["_id"]),
+        user_id=user_id,
+        product_id=payload.product_id,
+        quantity=doc["quantity"],
+        product_name=product.name,
+        product_price=product.price,
+        line_total=product.price * doc["quantity"],
+    )
 
 
 @app.put("/cart/{user_id}/items/{item_id}", response_model=CartItemOut)
 def update_cart_item(
     user_id: str,
-    item_id: int,
+    item_id: str,
     payload: CartItemUpdate,
     db: Session = Depends(get_db),
 ):
-    item = (
-        db.query(CartItem)
-        .filter(CartItem.id == item_id, CartItem.user_id == user_id)
-        .first()
-    )
-    if not item:
+    try:
+        obj_id = ObjectId(item_id)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Некорректный ID позиции")
+
+    doc = cart_collection.find_one({"_id": obj_id, "user_id": user_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="Позиция корзины не найдена")
-    if item.product.stock < payload.quantity:
+
+    product = db.get(Product, doc["product_id"])
+    if not product:
+        raise HTTPException(status_code=404, detail="Товар не найден в каталоге")
+    if product.stock < payload.quantity:
         raise HTTPException(status_code=400, detail="Недостаточно товара на складе")
-    item.quantity = payload.quantity
-    db.commit()
-    db.refresh(item)
-    return cart_item_to_out(item)
+
+    updated_doc = cart_collection.find_one_and_update(
+        {"_id": obj_id},
+        {"$set": {"quantity": payload.quantity}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    return CartItemOut(
+        id=str(updated_doc["_id"]),
+        user_id=user_id,
+        product_id=updated_doc["product_id"],
+        quantity=updated_doc["quantity"],
+        product_name=product.name,
+        product_price=product.price,
+        line_total=product.price * updated_doc["quantity"],
+    )
 
 
 @app.delete("/cart/{user_id}/items/{item_id}", status_code=204)
-def remove_from_cart(user_id: str, item_id: int, db: Session = Depends(get_db)):
-    item = (
-        db.query(CartItem)
-        .filter(CartItem.id == item_id, CartItem.user_id == user_id)
-        .first()
-    )
-    if not item:
+def remove_from_cart(user_id: str, item_id: str):
+    try:
+        obj_id = ObjectId(item_id)
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Некорректный ID позиции")
+
+    res = cart_collection.delete_one({"_id": obj_id, "user_id": user_id})
+    if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Позиция корзины не найдена")
-    db.delete(item)
-    db.commit()
 
 
 @app.delete("/cart/{user_id}", status_code=204)
-def clear_cart(user_id: str, db: Session = Depends(get_db)):
-    db.query(CartItem).filter(CartItem.user_id == user_id).delete()
-    db.commit()
+def clear_cart(user_id: str):
+    cart_collection.delete_many({"user_id": user_id})
 
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
-    db.execute(__import__("sqlalchemy").text("SELECT 1"))
-    return {"status": "ok", "db": "postgresql via pgpool"}
+    # Проверка PostgreSQL
+    db.execute(text("SELECT 1"))
+    # Проверка MongoDB
+    mongo_client.admin.command("ping")
+    return {
+        "status": "ok",
+        "databases": {
+            "products": "postgresql via pgpool",
+            "cart": "mongodb",
+        },
+    }

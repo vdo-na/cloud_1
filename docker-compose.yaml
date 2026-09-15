@@ -55,6 +55,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+ 
+  mongo:
+    image: mongo:7.0
+    container_name: shop-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
 
   pgpool:
     build: ./pgpool
@@ -82,15 +91,19 @@ services:
   backend:
     build: ./backend
     container_name: shop-api
+    ports:
+      - "8000:8000"
     depends_on:
       pgpool:
         condition: service_healthy
-    ports:
-      - "8000:8000"
+      mongo:
+        condition: service_started
     environment:
-      DATABASE_URL: postgresql+psycopg2://app:app@pgpool:9999/appdb
+      - "DATABASE_URL=postgresql+psycopg2://app:app@pgpool:9999/appdb"
+      - "MONGO_URL=mongodb://mongo:27017/shop_db"
 
 volumes:
   pg1_data:
   pg2_data:
   pg3_data:
+  mongo_data:
