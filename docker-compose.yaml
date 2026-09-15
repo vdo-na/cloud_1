@@ -72,6 +72,23 @@ services:
       - ./pgpool/pgpool.conf:/etc/pgpool2/pgpool.conf:ro
       - ./pgpool/pool_hba.conf:/etc/pgpool2/pool_hba.conf:ro
       - ./pgpool/pcp.conf:/etc/pgpool2/pcp.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 9999 -U app -d appdb || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  backend:
+    build: ./backend
+    container_name: shop-api
+    depends_on:
+      pgpool:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@pgpool:9999/appdb
 
 volumes:
   pg1_data:
