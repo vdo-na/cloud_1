@@ -55,7 +55,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
- 
+
   mongo:
     image: mongo:7.0
     container_name: shop-mongo
@@ -88,6 +88,7 @@ services:
       retries: 20
       start_period: 10s
 
+  # API для п.3: товары в PG, корзина в MongoDB
   backend:
     build: ./backend
     container_name: shop-api
@@ -99,8 +100,22 @@ services:
       mongo:
         condition: service_started
     environment:
-      - "DATABASE_URL=postgresql+psycopg2://app:app@pgpool:9999/appdb"
-      - "MONGO_URL=mongodb://mongo:27017/shop_db"
+      DATABASE_URL: postgresql+psycopg2://app:app@pgpool:9999/appdb
+      MONGO_URL: mongodb://mongo:27017/shop_db
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # API для п.4: товары и корзина через PostgreSQL multimaster + pgpool
+  backend_pgpool:
+    build: ./backend
+    container_name: shop-api-pgpool
+    ports:
+      - "8001:8000"
+    depends_on:
+      pgpool:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@pgpool:9999/appdb
+    command: ["uvicorn", "main_pgpool:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:
   pg1_data:

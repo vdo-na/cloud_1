@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Оба варианта API в одном образе; какой запускать — задаёт command в compose
 COPY main.py .
+COPY main_pgpool.py .
 
 EXPOSE 8000
 

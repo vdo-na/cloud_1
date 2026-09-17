@@ -6,48 +6,50 @@
 
 ---
 
-## Что здесь есть (пункты 1–2)
+## Что здесь есть (пункты 1–4)
 
 | Пункт | Что сделано |
 |-------|-------------|
 | **1** | 3 инстанса PostgreSQL 16 + Pgpool II (native replication + load balancing) |
-| **2** | Backend магазина на FastAPI: CRUD товаров и корзины, чтение/запись через pgpool |
+| **2** | Backend магазина на FastAPI: CRUD товаров и корзины |
+| **3** | Корзина перенесена в MongoDB (`main.py`); каталог остаётся в PostgreSQL через pgpool |
+| **4** | Два нагрузочных теста: Mongo (`load_test.py` → `:8000`) и pgpool (`load_test_pgpool.py` → `:8001`) |
 
-Дальше по заданию (ещё не в этом репо):
-- **п.3** — перенести часть данных (например корзину) в NoSQL / in-memory СУБД
-- **п.4** — нагрузочное тестирование обоих вариантов архитектуры
+Одна команда поднимает **оба** API сразу:
+
+| Сервис | Порт | Корзина | Файл |
+|--------|------|---------|------|
+| `shop-api` | `:8000` | MongoDB | `backend/main.py` |
+| `shop-api-pgpool` | `:8001` | PostgreSQL через pgpool | `backend/main_pgpool.py` |
 
 ---
 
 ## Как это устроено
 
 ```
-                    ┌─────────────────┐
-   браузер / curl   │  FastAPI        │  :8000
-   http://localhost:8000/docs         │  shop-api
-                    └────────┬────────┘
-                             │  DATABASE_URL → pgpool:9999
-                             ▼
-                    ┌─────────────────┐
-                    │  Pgpool II      │  :9999  (с хоста)
-                    │  балансировка   │
-                    │  + репликация   │
-                    └─────┬───┬───┬───┘
-                          │   │   │
-              ┌───────────┘   │   └───────────┐
-              ▼               ▼               ▼
-         ┌────────┐      ┌────────┐      ┌────────┐
-         │  pg1   │      │  pg2   │      │  pg3   │
-         │ :5433  │      │ :5434  │      │ :5435  │
-         └────────┘      └────────┘      └────────┘
+   :8000 shop-api          :8001 shop-api-pgpool
+   (корзина → Mongo)       (корзина → PostgreSQL)
+          │                         │
+          │    ┌────────────────────┘
+          ▼    ▼
+     товары всегда через Pgpool :9999
+                    │
+          ┌─────────┼─────────┐
+          ▼         ▼         ▼
+        pg1       pg2       pg3
+       :5433     :5434     :5435
+
+   MongoDB :27017 — только для корзины API на :8000
 ```
 
 **Идея простыми словами**
 
-1. Клиент ходит только в **API** (`:8000`), а не в базы напрямую.
-2. API пишет и читает через **один вход** — Pgpool (`:9999`).
-3. Pgpool раздаёт запросы по трём PostgreSQL и держит их синхронизированными (режим `native_replication`).
-4. С хоста можно зайти и в отдельный узел (`5433` / `5434` / `5435`), если нужно проверить, что данные реально реплицируются.
+1. Клиент ходит в API, а не в базы напрямую.
+2. **Каталог товаров** всегда в PostgreSQL через Pgpool (`:9999`).
+3. Есть **два варианта корзины** для сравнения в п.4:
+   - `:8000` — корзина в MongoDB (п.3)
+   - `:8001` — корзина тоже в PostgreSQL через pgpool (как в п.2)
+4. Pgpool раздаёт SQL по трём узлам (`native_replication` + load balancing).
 
 ---
 
@@ -56,12 +58,12 @@
 ### Что нужно
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (или Docker Engine + Compose)
-- Порты свободны: `8000`, `9999`, `5433–5435`
+- Порты свободны: `8000`, `8001`, `9999`, `5433–5435`, `27017`
 
 ### Запуск
 
 ```bash
-cd pg-multimaster
+cd cloud_1
 docker compose up -d --build
 ```
 
@@ -71,22 +73,25 @@ docker compose up -d --build
 
 ```bash
 docker compose ps
-curl http://localhost:8000/health
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8001/health
 ```
 
-Ожидаемый ответ health:
+Ожидаемо:
 
-```json
-{"status":"ok","db":"postgresql via pgpool"}
-```
+- `:8000` → `"cart": "mongodb"`
+- `:8001` → `"cart": "postgresql via pgpool"` (и `"variant": "pgpool-postgres"`)
 
 ### Куда кликать
 
 | Что | Адрес |
 |-----|--------|
-| **Swagger UI** (тыкай API мышкой) | http://localhost:8000/docs |
-| Healthcheck | http://localhost:8000/health |
-| Pgpool (PostgreSQL-протокол) | `localhost:9999` |
+| Swagger UI (Mongo-корзина) | http://localhost:8000/docs |
+| Swagger UI (pgpool-корзина) | http://localhost:8001/docs |
+| Health Mongo-API | http://localhost:8000/health |
+| Health pgpool-API | http://localhost:8001/health |
+| Pgpool | `localhost:9999` |
+| MongoDB | `localhost:27017` |
 
 ### Остановка
 
@@ -228,28 +233,35 @@ curl http://localhost:8000/cart/artem
 ## Структура репозитория
 
 ```text
-pg-multimaster/
-├── docker-compose.yaml     # весь стек: pg1–3, pgpool, backend
-├── README.md               # этот файл
+cloud_1/
+├── docker-compose.yaml       # весь стек: pg1–3, pgpool, mongo, оба API
+├── README.md
+├── load_test.py              # нагрузка Mongo-API (:8000)
+├── load_test_pgpool.py       # нагрузка pgpool-API (:8001)
 ├── postgres/
-│   └── init.sql            # схема + сиды при первом создании томов
+│   └── init.sql
 ├── pgpool/
 │   ├── Dockerfile
-│   ├── pgpool.conf         # native_replication, load_balance, 3 backend'а
+│   ├── pgpool.conf
 │   ├── pool_hba.conf
 │   └── pcp.conf
 └── backend/
-    ├── Dockerfile
-    ├── main.py             # FastAPI + SQLAlchemy
+    ├── Dockerfile            # один образ: main.py + main_pgpool.py
+    ├── main.py               # товары PG + корзина Mongo
+    ├── main_pgpool.py        # товары и корзина через pgpool
+    ├── migrate_to_mongo.py
+    ├── mongo.py
     ├── requirements.txt
-    └── init_shop.sql       # копия схемы (удобно смотреть / гонять вручную)
+    └── init_shop.sql
 ```
 
 **Порядок старта в Compose**
 
 1. `pg1`, `pg2`, `pg3` → healthcheck `pg_isready`
-2. `pgpool` → ждёт здоровые узлы, сам проходит healthcheck
-3. `backend` → ждёт здоровый pgpool, при старте создаёт таблицы (если надо) и сиды
+2. `mongo` стартует параллельно
+3. `pgpool` → ждёт здоровые узлы
+4. `backend` (`:8000`) → Mongo-корзина
+5. `backend_pgpool` (`:8001`) → корзина в PostgreSQL через pgpool
 
 ---
 
@@ -288,7 +300,7 @@ docker compose exec pg3 psql -U app -d appdb -c "SELECT count(*) FROM products;"
 
 | Симптом | Что сделать |
 |---------|-------------|
-| `port is already allocated` | Занят порт `8000` / `9999` / `5433–5435`. Освободи или поменяй mapping в `docker-compose.yaml` |
+| `port is already allocated` | Занят порт `8000` / `8001` / `9999` / `5433–5435` / `27017`. Освободи или поменяй mapping в `docker-compose.yaml` |
 | backend в `Restarting` | `docker compose logs backend` — часто ещё не готов pgpool; у API есть ретраи ~1 мин |
 | Пустой каталог `/products` | Тома старые без сидов: `docker compose down -v && docker compose up -d --build` |
 | `connection refused` на `:8000` | Контейнер ещё поднимается: `docker compose ps` и подожди `healthy` / `running` |
@@ -318,9 +330,54 @@ uvicorn main:app --reload --port 8000
 
 ---
 
+
+---
+
+## Пункт 3 — корзина в MongoDB
+
+- Сервис `mongo` в Compose, порт `27017`
+- API `:8000` (`backend/main.py`) пишет корзину в коллекцию `cart_items`
+- Каталог товаров по-прежнему через pgpool
+- Разовая миграция старых строк из PG: `backend/migrate_to_mongo.py`
+
+```powershell
+$env:DATABASE_URL="postgresql+psycopg2://app:app@localhost:9999/appdb"
+$env:MONGO_URL="mongodb://localhost:27017/shop_db"
+python backend/migrate_to_mongo.py
+```
+
+---
+
+## Пункт 4 — нагрузочное тестирование
+
+Одинаковый сценарий в обоих тестах: **20** потоков, **20** секунд, `POST /cart/.../items` + `GET /cart/...`.
+
+### Тест Mongo (порт 8000)
+
+```powershell
+cd C:\Users\admin\Desktop\cloud_1
+docker compose up -d --build
+python load_test.py
+```
+
+### Тест pgpool / PostgreSQL (порт 8001)
+
+```powershell
+cd C:\Users\admin\Desktop\cloud_1
+docker compose up -d --build
+python load_test_pgpool.py
+```
+
+Отчёт pgpool-теста сохраняется в `results_pgpool.json` (RPS, avg, p95, ошибки).
+
+Сравни метрики двух прогонов и занеси в отчёт по лабе.
+
+---
+
 ## Итог для проверяющего
 
-- **Multimaster PostgreSQL**: три узла + Pgpool II (`backend_clustering_mode = native_replication`, `load_balance_mode = on`).
-- **Backend**: FastAPI, достаточный CRUD для каталога и корзины, доступ к БД только через pgpool.
-- **Данные**: сгенерированные товары при старте; корзина привязана к строковому `user_id`.
-- **Запуск**: `docker compose up -d --build` → http://localhost:8000/docs
+- **Multimaster PostgreSQL**: три узла + Pgpool II (`native_replication`, `load_balance_mode = on`).
+- **Два API из одного образа**: `:8000` — корзина в MongoDB; `:8001` — корзина через pgpool.
+- **п.3**: MongoDB + `migrate_to_mongo.py`.
+- **п.4**: `load_test.py` (Mongo) и `load_test_pgpool.py` (pgpool).
+- **Запуск всего стека**: `docker compose up -d --build`
